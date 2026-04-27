@@ -17,7 +17,7 @@
 // --- PWM 默认参数 ---
 #define PWM_BITS          8
 #define PWM_FREQ_DEFAULT  20000
-#define PPR_DEFAULT       2496
+#define PPR_DEFAULT       4680
 
 // --- 协议：命令字 ---
 #define CMD_INIT        0x01
@@ -283,6 +283,19 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
     case CMD_GET_STATUS:
       sendStatus();
       break;
+
+    case 0x30: {  // DEBUG: 读取编码器原始计数
+      noInterrupts();
+      long c1 = encoderCount, c2 = encoderCount2;
+      interrupts();
+      uint8_t buf[8];
+      buf[0] = (uint8_t)(c1 >> 24); buf[1] = (uint8_t)(c1 >> 16);
+      buf[2] = (uint8_t)(c1 >> 8);  buf[3] = (uint8_t)(c1 & 0xFF);
+      buf[4] = (uint8_t)(c2 >> 24); buf[5] = (uint8_t)(c2 >> 16);
+      buf[6] = (uint8_t)(c2 >> 8);  buf[7] = (uint8_t)(c2 & 0xFF);
+      sendFrame(0x30, buf, 8);
+      break;
+    }
 
     case CMD_RESET:
       motorCoast(0); motorCoast(1);

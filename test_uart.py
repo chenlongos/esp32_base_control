@@ -9,7 +9,7 @@ import struct
 import sys
 
 # ── 配置 ──────────────────────────────────────────────
-PORT     = "COM10"
+PORT     = "COM8"
 BAUD     = 115200
 TIMEOUT  = 1.0   # 秒
 
@@ -178,9 +178,9 @@ def test_init(ser, t):
 
 def test_config(ser, t):
     print(f"\n{INFO} ── 测试 CONFIG ──")
-    # 正常配置：PPR=2496, FREQ=20000
-    payload = struct.pack(">HH", 2496, 20000)
-    expect_ack(ser, CMD_CONFIG, payload, tester=t, name="CONFIG(2496, 20000Hz)")
+    # 正常配置：PPR=4680 (1:90减速比), FREQ=20000
+    payload = struct.pack(">HH", 4680, 20000)
+    expect_ack(ser, CMD_CONFIG, payload, tester=t, name="CONFIG(4680, 20000Hz)")
 
     # CONFIG 之后再次 CONFIG 应该 NACK（状态已是 READY，不是 IDLE）
     # 先重新 INIT → IDLE
@@ -189,7 +189,7 @@ def test_config(ser, t):
     payload_bad = struct.pack(">HH", 0, 20000)
     expect_nack(ser, CMD_CONFIG, payload_bad, ERR_INVALID_PARAM, tester=t, name="CONFIG(PPR=0, 非法)")
     # 恢复到 READY
-    ser.write(build_frame(CMD_CONFIG, struct.pack(">HH", 2496, 20000))); recv_frame(ser)
+    ser.write(build_frame(CMD_CONFIG, struct.pack(">HH", 4680, 20000))); recv_frame(ser)
 
 
 def test_get_status(ser, t):
@@ -233,7 +233,20 @@ def test_set_speed(ser, t):
 
 def test_get_rpm(ser, t):
     print(f"\n{INFO} ── 测试 GET_RPM ──")
-    time.sleep(0.3)  # 让电机稳定
+    time.sleep(0.3)  # 让电机稳定（1:90减速比需要更长时间）
+
+    # 诊断：读取编码器原始计数
+    print(f"\n{INFO} ── 诊断：编码器原始计数 ──")
+    ser.reset_input_buffer()
+    ser.write(build_frame(0x30))
+    resp = recv_frame(ser)
+    if resp and resp["cmd"] == 0x30 and len(resp["payload"]) >= 8:
+        c1 = struct.unpack(">l", resp["payload"][0:4])[0]
+        c2 = struct.unpack(">l", resp["payload"][4:8])[0]
+        print(f"       M1 encoder count: {c1}  M2 encoder count: {c2}")
+        t.check("编码器有计数", c1 != 0 or c2 != 0, f"M1={c1}, M2={c2}")
+    else:
+        print(f"  {WARN} 无法读取编码器计数")
 
     # 查 M1
     resp = send_recv(ser, CMD_GET_RPM, bytes([0]))
@@ -320,7 +333,7 @@ def test_reset(ser, t):
     print(f"\n{INFO} ── 测试 RESET ──")
     # 先让电机跑起来
     ser.write(build_frame(CMD_INIT)); recv_frame(ser)
-    ser.write(build_frame(CMD_CONFIG, struct.pack(">HH", 2496, 20000))); recv_frame(ser)
+    ser.write(build_frame(CMD_CONFIG, struct.pack(">HH", 4680, 20000))); recv_frame(ser)
     ser.write(build_frame(CMD_SET_SPEED, struct.pack(">Bh", 0, 200))); recv_frame(ser)
     time.sleep(0.2)
 
