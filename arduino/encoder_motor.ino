@@ -1,10 +1,17 @@
 // ============================================================
-//  ESP32-C3 SuperMini + DRV8833 x2 + 霍尔编码�?TT 马达
-//  UART 控制协议 V1.0  |  波特�?115200
+//  ESP32-C3 SuperMini + DRV8833 x2 + 霍尔编码器TT 马达
+//  UART 控制协议 V1.0  |  波特率115200
 // ============================================================
+
+// --- 编译配置（切换配置时修改这里） ---
+// #define CONFIG_ID  0   // 配置0：调试
+#define CONFIG_ID  1   // 配置1：生产
 
 // --- 引脚定义 ---
 #define LED_PIN    8
+#ifdef CONFIG_ID
+#if CONFIG_ID == 0
+// 配置0：调试引脚
 #define IN1_PIN    4
 #define IN2_PIN    3
 #define ENC_A      5
@@ -13,6 +20,18 @@
 #define IN2_PIN_2  2
 #define ENC_A_2    7
 #define ENC_B_2   10
+#elif CONFIG_ID == 1
+// 配置1：生产引脚（默认）
+#define IN1_PIN    4
+#define IN2_PIN    3
+#define ENC_A      5
+#define ENC_B      6
+#define IN1_PIN_2  1
+#define IN2_PIN_2  2
+#define ENC_A_2    7
+#define ENC_B_2   10
+#endif
+#endif
 
 // --- PWM 默认参数 ---
 #define PWM_BITS          8
@@ -35,7 +54,7 @@
 #define RSP_RPM_DATA    0x90
 #define RSP_STATUS      0x91
 
-// --- 错误�?---
+// --- 错误---
 #define ERR_WRONG_STATE   0x01
 #define ERR_BAD_CHECKSUM  0x02
 #define ERR_INVALID_PARAM 0x03
@@ -51,16 +70,16 @@ HardwareSerial SerialUART0(0);
 #define FRAME_H2  0x55
 
 // ============================================================
-//  系统状�?// ============================================================
+//  系统状态// ============================================================
 enum SysState : uint8_t { UNINIT = 0, IDLE = 1, READY = 2, RUNNING = 3, SYS_ERROR = 4 };
 SysState sysState = UNINIT;
 
-// --- 配置（可�?CONFIG 命令修改�?--
+// --- 配置（可配置CONFIG 命令修改--
 uint16_t cfg_ppr      = PPR_DEFAULT;
 uint16_t cfg_pwm_freq = PWM_FREQ_DEFAULT;
 
 // ============================================================
-//  编码器（中断，需 IRAM�?// ============================================================
+//  编码器（中断，需 IRAM// ============================================================
 volatile long encoderCount  = 0;
 volatile long encoderCount2 = 0;
 volatile unsigned long isrCalls1 = 0, isrCalls2 = 0;
@@ -76,7 +95,7 @@ long lastCnt1 = 0, lastCnt2 = 0;
 int16_t rpm1 = 0, rpm2 = 0;
 
 // ============================================================
-//  LED 状�?// ============================================================
+//  LED 状态// ============================================================
 unsigned long lastLedTime = 0;
 uint8_t ledPhase = 0;
 
@@ -89,7 +108,7 @@ uint8_t rxCmd, rxLen, rxIdx;
 uint8_t rxBuf[16];
 
 // ============================================================
-//  初始化辅�?// ============================================================
+//  初始化辅助// ============================================================
 void initMotorPins(int p1, int p2) {
   pinMode(p1, OUTPUT);
   pinMode(p2, OUTPUT);
@@ -139,8 +158,8 @@ void loop() {
     processByte((uint8_t)SerialUART0.read());
   }
 
-  // �?100ms 更新 RPM
-  if (now - lastRpmTime >= 100) {
+  // 20ms 更新 RPM
+  if (now - lastRpmTime >= 20) {
     noInterrupts();
     long s1 = encoderCount, s2 = encoderCount2;
     interrupts();
@@ -180,7 +199,7 @@ void updateLed(unsigned long now) {
       }
       break;
     case SYS_ERROR: {
-      // 双闪：亮100 �?00 �?00 �?00
+      // 双闪：亮100 00 00 00
       unsigned long interval = (ledPhase < 3) ? 100 : 700;
       if (now - lastLedTime >= interval) {
         lastLedTime = now;
