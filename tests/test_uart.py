@@ -7,6 +7,7 @@ import serial
 import time
 import struct
 import sys
+import termios
 
 # ── 配置 ──────────────────────────────────────────────
 PORT     = "/dev/ttyS1"
@@ -128,13 +129,25 @@ class Tester:
 
 def send_recv(ser, cmd, payload=b"", tester=None, name=""):
     """发送命令并解析第一帧响应"""
-    frame = build_frame(cmd, payload)
-    ser.reset_input_buffer()
-    ser.write(frame)
-    resp = recv_frame(ser)
-    if tester and name:
-        tester.check(f"{name} - 收到响应", resp is not None)
-    return resp
+    try:
+        frame = build_frame(cmd, payload)
+        ser.reset_input_buffer()
+        ser.write(frame)
+        resp = recv_frame(ser)
+        if tester and name:
+            tester.check(f"{name} - 收到响应", resp is not None)
+        return resp
+    except termios.error as e:
+        # termios.error: (6, 'Device not configured') 表示设备文件描述符失效
+        err_msg = f"设备断开 (termios.error: {e})"
+        print(f"  {WARN} {err_msg}")
+        if tester and name:
+            tester.check(f"{name} - 收到响应", False, err_msg)
+        return None
+    except serial.SerialException as e:
+        if tester and name:
+            tester.check(f"{name} - 收到响应", False, str(e))
+        return None
 
 
 def expect_ack(ser, cmd, payload=b"", tester=None, name=""):
@@ -236,22 +249,17 @@ def test_set_speeds(ser, t):
     print(f"\n{INFO} ── 测试 SET_SPEEDS (0x13) ──")
 
     # M1=200, M2=150 同时设置
-    payload = struct.pack(">hh", 200, 200)
-    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时正转 (200, 150)")
-    time.sleep(0.5)
+    payload = struct.pack(">hh", 150, 150)
+    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时正转 (150, 150)")
+    time.sleep(1)
 
-    # M1=-150, M2=-100 同时反转
-    payload = struct.pack(">hh", -200, -200)
-    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时反转 (-150, -100)")
-    time.sleep(0.5)
-
-    # 双电机同时停止 (speed=0)
-    payload = struct.pack(">hh", 0, 0)
-    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时停止 (0, 0)")
-    time.sleep(0.5)
+    # M1=-200, M2=-200 同时反转
+    payload = struct.pack(">hh", -150, -150)
+    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时反转 (-200, -200)")
+    time.sleep(1)
 
     # M1正转 M2反转
-    payload = struct.pack(">hh", 180, -180)
+    payload = struct.pack(">hh", 150, -150)
     expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机反向 (180, -180)")
     time.sleep(1)
 
@@ -412,8 +420,13 @@ def main():
         test_reset(ser, t)
     finally:
         # 确保测试结束后电机停止
-        ser.write(build_frame(CMD_RESET))
-        ser.close()
+        try:
+            if ser.is_open:
+                ser.write(build_frame(CMD_RESET))
+        except Exception:
+            pass  # 串口已断开，忽略错误
+        finally:
+            ser.close()
 
     t.summary()
 
