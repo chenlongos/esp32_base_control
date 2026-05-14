@@ -8,7 +8,7 @@ import struct
 import time
 import sys
 
-PORT = "COM7"
+PORT = "/dev/ttyS1"
 BAUD = 115200
 PPR  = 4680
 

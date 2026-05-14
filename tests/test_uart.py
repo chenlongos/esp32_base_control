@@ -9,7 +9,7 @@ import struct
 import sys
 
 # ── 配置 ──────────────────────────────────────────────
-PORT     = "/dev/cu.usbmodem1101"
+PORT     = "/dev/ttyS1"
 BAUD     = 115200
 TIMEOUT  = 1.0   # 秒
 
@@ -245,15 +245,15 @@ def test_set_speeds(ser, t):
     expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时反转 (-150, -100)")
     time.sleep(0.5)
 
-    # M1正转 M2反转
-    payload = struct.pack(">hh", 180, -180)
-    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机反向 (180, -180)")
-    time.sleep(1)
-
     # 双电机同时停止 (speed=0)
     payload = struct.pack(">hh", 0, 0)
     expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机同时停止 (0, 0)")
     time.sleep(0.5)
+
+    # M1正转 M2反转
+    payload = struct.pack(">hh", 180, -180)
+    expect_ack(ser, CMD_SET_SPEEDS, payload, tester=t, name="双电机反向 (180, -180)")
+    time.sleep(1)
 
 
 def test_get_rpm(ser, t):
@@ -398,22 +398,22 @@ def main():
 
     t = Tester()
 
-    # try:
-        # test_init(ser, t)
-        # test_config(ser, t)
-        # test_get_status(ser, t)
-        # test_set_speed(ser, t)
-    test_set_speeds(ser, t)
-        # test_get_rpm(ser, t)
-        # test_stop_brake(ser, t)
-        # test_wrong_state(ser, t)
-        # test_bad_checksum(ser, t)
-        # test_unknown_cmd(ser, t)
-        # test_reset(ser, t)
-    # finally:
+    try:
+        test_init(ser, t)
+        test_config(ser, t)
+        test_get_status(ser, t)
+        test_set_speed(ser, t)
+        test_set_speeds(ser, t)
+        test_get_rpm(ser, t)
+        test_stop_brake(ser, t)
+        test_wrong_state(ser, t)
+        test_bad_checksum(ser, t)
+        test_unknown_cmd(ser, t)
+        test_reset(ser, t)
+    finally:
         # 确保测试结束后电机停止
-        # ser.write(build_frame(CMD_RESET))
-        # ser.close()
+        ser.write(build_frame(CMD_RESET))
+        ser.close()
 
     t.summary()
 
