@@ -107,12 +107,14 @@ int16_t rpm1 = 0, rpm2 = 0;
 
 // --- PWM / PID 常数 ---
 #define PWM_RPM_MAX 150.0f
-#define PID_KP 1.2f   // 误差 50 RPM → 每周期 +60 PWM，~0.07s 到位
-#define PID_KI 0.005f  // 积分消静差
-#define PID_KD 0.01f  // 微分（降低以减少噪声放大）
+#define PID_KP 0.8f   // P-only 比例增益（前馈承担主力，P 只做加速/减速修正）
+#define PID_KI 0.10f  // 积分项：低速时填补前馈误差，积分上限×Ki=30PWM
+#define PID_KD 0.01f  // 微分（未使用）
 #define PID_INTEGRAL_MAX 300
 #define PID_OUTPUT_MAX 255  // 最大输出
-#define START_PWM_MIN 20    // 启动补偿最低值
+#define MIN_USEFUL_RPM  10.0f  // 电机能稳定运转的最低 RPM
+#define FRICTION_BOOST  10     // 突破静摩擦的额外 PWM
+#define FF_GAIN         2.0f   // 前馈增益: 1.0=线性估算, 实测偏低故×2
 #define RPM_DEADZONE 3.0f
 
 struct PIDController {
@@ -139,13 +141,26 @@ int rpmToPwm(float rpm) {
   return (int)(rpm * 255.0f / PWM_RPM_MAX);
 }
 
-// PID 计算（参考 DB20_3 累积式 PID）
+// 前馈 + P + 小 I（I 只填补前馈估算误差，不主导）
 void computePID(PIDController* pid, float target_rpm, float current_rpm) {
+  float abs_target = fabs(target_rpm);
+  float abs_current = fabs(current_rpm);
+  float sign = (target_rpm > 0) ? 1.0f : ((target_rpm < 0) ? -1.0f : 0.0f);
   float bias = target_rpm - current_rpm;
-  float derivative = bias - pid->prev_error;
-  pid->prev_error = bias;
 
-  // 积分抗饱和
+  // 前馈
+  float ff = sign * rpmToPwm(abs_target) * FF_GAIN;
+
+  // 静摩擦突破：仅电机不转时激活
+  float friction_boost = 0;
+  if (abs_current < 2.0f && abs_target > RPM_DEADZONE) {
+    float pwm_need = rpmToPwm(MIN_USEFUL_RPM) + FRICTION_BOOST;
+    if (rpmToPwm(abs_target) < pwm_need) {
+      friction_boost = sign * (pwm_need - rpmToPwm(abs_target));
+    }
+  }
+
+  // 积分：输出未饱和时才累加，上限 200
   bool sat_high = (pid->output >= PID_OUTPUT_MAX && bias > 0);
   bool sat_low  = (pid->output <= -PID_OUTPUT_MAX && bias < 0);
   if (!sat_high && !sat_low) {
@@ -154,12 +169,15 @@ void computePID(PIDController* pid, float target_rpm, float current_rpm) {
   if (pid->integral > PID_INTEGRAL_MAX) pid->integral = PID_INTEGRAL_MAX;
   if (pid->integral < -PID_INTEGRAL_MAX) pid->integral = -PID_INTEGRAL_MAX;
 
-  // 浮点累积，避免小增益 × 小误差被截断为 0
-  pid->output_f += pid->Kp * bias + pid->Ki * pid->integral + pid->Kd * derivative;
-  pid->output = (int)pid->output_f;
+  // P + I 修正
+  float p_term = PID_KP * bias;
+  float i_term = PID_KI * pid->integral;
 
-  if (pid->output > PID_OUTPUT_MAX) { pid->output = PID_OUTPUT_MAX; pid->output_f = PID_OUTPUT_MAX; }
-  if (pid->output < -PID_OUTPUT_MAX) { pid->output = -PID_OUTPUT_MAX; pid->output_f = -PID_OUTPUT_MAX; }
+  float total = ff + friction_boost + p_term + i_term;
+  pid->output = (int)total;
+
+  if (pid->output > PID_OUTPUT_MAX) pid->output = PID_OUTPUT_MAX;
+  if (pid->output < -PID_OUTPUT_MAX) pid->output = -PID_OUTPUT_MAX;
 }
 
 // ============================================================
@@ -599,19 +617,10 @@ void runMotorControl(float dt) {
   // Motor 1
   if (abs(pid1.target_rpm) < RPM_DEADZONE) {
     pid1.integral = 0;
-    pid1.output = 0; pid1.output_f = 0;
-    pid1.prev_error = 0;
+    pid1.output = 0;
     analogWrite(IN1_PIN, 0); analogWrite(IN2_PIN, 0);
   } else {
     computePID(&pid1, pid1.target_rpm, (float)rpm1);
-    // 启动补偿：按目标比例，避免小目标超调
-    int start1 = rpmToPwm(abs(pid1.target_rpm)) / 2;
-    if (start1 < START_PWM_MIN) start1 = START_PWM_MIN;
-    if (abs(rpm1) < 3 && pid1.output > 0 && pid1.output < start1) {
-      pid1.output = start1; pid1.output_f = start1;
-    } else if (abs(rpm1) < 3 && pid1.output < 0 && pid1.output > -start1) {
-      pid1.output = -start1; pid1.output_f = -start1;
-    }
     int pwm = abs(pid1.output);
     if (pid1.output > 0) motorForward(pwm);
     else                 motorReverse(pwm);
@@ -619,18 +628,10 @@ void runMotorControl(float dt) {
   // Motor 2
   if (abs(pid2.target_rpm) < RPM_DEADZONE) {
     pid2.integral = 0;
-    pid2.output = 0; pid2.output_f = 0;
-    pid2.prev_error = 0;
+    pid2.output = 0;
     analogWrite(IN1_PIN_2, 0); analogWrite(IN2_PIN_2, 0);
   } else {
     computePID(&pid2, pid2.target_rpm, (float)rpm2);
-    int start2 = rpmToPwm(abs(pid2.target_rpm)) / 2;
-    if (start2 < START_PWM_MIN) start2 = START_PWM_MIN;
-    if (abs(rpm2) < 3 && pid2.output > 0 && pid2.output < start2) {
-      pid2.output = start2; pid2.output_f = start2;
-    } else if (abs(rpm2) < 3 && pid2.output < 0 && pid2.output > -start2) {
-      pid2.output = -start2; pid2.output_f = -start2;
-    }
     int pwm = abs(pid2.output);
     if (pid2.output > 0) motorForward2(pwm);
     else                 motorReverse2(pwm);
