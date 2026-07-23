@@ -30,6 +30,8 @@ struct PIDController;
 #define CMD_BRAKE       0x12
 #define CMD_GET_RPM     0x20
 #define CMD_GET_STATUS  0x21
+#define CMD_GET_ENCODER 0x22  // 读取编码器累计脉冲
+#define CMD_MOVE_DISTANCE 0x23  // 闭环距离控制
 #define CMD_SET_SPEEDS  0x13  // 新增：同时设置双电机速度
 #define CMD_SET_PID     0x14  // 设置PID参数
 #define CMD_GET_PID     0x15  // 读取PID参数
@@ -98,6 +100,13 @@ void IRAM_ATTR encB2_ISR() { encoderCount2 += (digitalRead(ENC_A_2) == digitalRe
 
 // --- RPM 计算 ---
 unsigned long lastRpmTime = 0;
+
+// --- 距离控制状态（CMD_MOVE_DISTANCE） ---
+bool distCtrlActive = false;
+long distStartL = 0, distStartR = 0;
+long distTarget = 0;
+uint8_t distDir = 0;  // 0=forward, 1=backward, 2=left, 3=right
+uint8_t distSpeed = 0;
 long lastCnt1 = 0, lastCnt2 = 0;
 int16_t rpm1 = 0, rpm2 = 0;
 
@@ -261,6 +270,18 @@ void loop() {
     lastRpmTime = now;
     if (sysState >= READY) {
       runMotorControl(dt);
+      // 距离闭环：到达目标自动停车
+      if (distCtrlActive) {
+        long curL, curR;
+        noInterrupts();
+        curL = encoderCount; curR = encoderCount2;
+        interrupts();
+        long delta = max(abs(curL - distStartL), abs(curR - distStartR));
+        if (delta >= distTarget) {
+          motorBrake(0); motorBrake(1);
+          distCtrlActive = false;
+        }
+      }
     }
   }
 
@@ -484,6 +505,44 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       sendStatus();
       break;
 
+    case CMD_GET_ENCODER: {  // 返回 M1/M2 累计脉冲（各 4 字节，共 8 字节）
+      noInterrupts();
+      long c1 = encoderCount, c2 = encoderCount2;
+      interrupts();
+      uint8_t buf[8];
+      buf[0] = (uint8_t)(c1 >> 24); buf[1] = (uint8_t)(c1 >> 16);
+      buf[2] = (uint8_t)(c1 >> 8);  buf[3] = (uint8_t)(c1 & 0xFF);
+      buf[4] = (uint8_t)(c2 >> 24); buf[5] = (uint8_t)(c2 >> 16);
+      buf[6] = (uint8_t)(c2 >> 8);  buf[7] = (uint8_t)(c2 & 0xFF);
+      sendFrame(cmd, buf, 8);
+      break;
+    }
+
+    case CMD_MOVE_DISTANCE: {  // payload: dir(1) speed(1) target(4B big-endian)
+      if (sysState < READY) { sendNack(cmd, ERR_WRONG_STATE); return; }
+      if (len != 6) { sendNack(cmd, ERR_INVALID_PARAM); return; }
+      distDir   = p[0];
+      distSpeed = p[1];
+      distTarget = ((long)p[2] << 24) | ((long)p[3] << 16) | ((long)p[4] << 8) | (long)p[5];
+      if (distDir > 3 || distSpeed == 0 || distSpeed > 100) {
+        sendNack(cmd, ERR_INVALID_PARAM); return;
+      }
+      noInterrupts();
+      distStartL = encoderCount;
+      distStartR = encoderCount2;
+      interrupts();
+      distCtrlActive = true;
+      // 通过 PID 控制（速度 -100~100）
+      int s = (int)distSpeed;
+      if (distDir == 0)      { setMotorSpeed(0, s); setMotorSpeed(1, s); }
+      else if (distDir == 1) { setMotorSpeed(0, -s); setMotorSpeed(1, -s); }
+      else if (distDir == 2) { setMotorSpeed(0, -s); setMotorSpeed(1, s); }
+      else                   { setMotorSpeed(0, s); setMotorSpeed(1, -s); }
+      sysState = RUNNING;
+      sendAck(cmd);
+      break;
+    }
+
     case 0x30: {  // DEBUG: 编码器计数 + ISR 触发次数
       noInterrupts();
       long c1 = encoderCount, c2 = encoderCount2;
@@ -613,6 +672,18 @@ void setMotorSpeed(uint8_t mid, int16_t speed) {
 }
 
 void runMotorControl(float dt) {
+      // 距离闭环：到达目标自动停车
+      if (distCtrlActive) {
+        long curL, curR;
+        noInterrupts();
+        curL = encoderCount; curR = encoderCount2;
+        interrupts();
+        long delta = max(abs(curL - distStartL), abs(curR - distStartR));
+        if (delta >= distTarget) {
+          motorBrake(0); motorBrake(1);
+          distCtrlActive = false;
+        }
+      }
   if (sysState == AUTO_TUNE) { runAutoTune(dt); return; }
   // Motor 1
   if (abs(pid1.target_rpm) < RPM_DEADZONE) {
