@@ -19,6 +19,10 @@
 #define PWM_FREQ_DEFAULT  20000
 #define PPR_DEFAULT       4680
 
+// --- 物理参数（里程计 / 距离换算）---
+#define WHEEL_DIAMETER_MM  62.0f   // 轮径 D
+#define WHEELBASE_MM       160.0f  // 轴距 L（左右轮中心距）
+
 // --- 前向声明（Arduino 自动原型生成需要） ---
 struct PIDController;
 
@@ -109,6 +113,50 @@ uint8_t distDir = 0;  // 0=forward, 1=backward, 2=left, 3=right
 uint8_t distSpeed = 0;
 long lastCnt1 = 0, lastCnt2 = 0;
 int16_t rpm1 = 0, rpm2 = 0;
+
+// ============================================================
+//  里程计换算（轮径 D、轴距 L、编码器 PPR）
+// ============================================================
+
+// 车轮每转行驶距离 (mm)
+float wheelCircumferenceMm() {
+  return WHEEL_DIAMETER_MM * PI;
+}
+
+// 行驶距离 (mm) → 编码器计数
+long mmToCounts(float mm) {
+  return (long)(mm * (float)cfg_ppr / wheelCircumferenceMm() + 0.5f);
+}
+
+// 编码器计数 → 行驶距离 (mm)
+float countsToMm(long counts) {
+  return (float)counts * wheelCircumferenceMm() / (float)cfg_ppr;
+}
+
+// 原地转向角度 (度) → 单轮编码器计数
+// 原地转向时每轮弧长 = θ(rad) × (L/2)
+long degreesToCounts(float degrees) {
+  float arcMm = degrees * (PI / 180.0f) * (WHEELBASE_MM / 2.0f);
+  return mmToCounts(arcMm);
+}
+
+// 距离/转向闭环：到达目标自动停车
+// 直行取左右轮平均（避免单轮打滑/速度差导致提前或滞后停车）；
+// 原地转向两轮反向等速，取较大值
+void updateDistanceControl() {
+  if (!distCtrlActive) return;
+  long curL, curR;
+  noInterrupts();
+  curL = encoderCount; curR = encoderCount2;
+  interrupts();
+  long dL = abs(curL - distStartL);
+  long dR = abs(curR - distStartR);
+  long delta = (distDir == 2 || distDir == 3) ? max(dL, dR) : ((dL + dR) / 2);
+  if (delta >= distTarget) {
+    motorBrake(0); motorBrake(1);
+    distCtrlActive = false;
+  }
+}
 
 // ============================================================
 //  PID 控制器（参考 DB20_3 累积式 PID）
@@ -270,18 +318,7 @@ void loop() {
     lastRpmTime = now;
     if (sysState >= READY) {
       runMotorControl(dt);
-      // 距离闭环：到达目标自动停车
-      if (distCtrlActive) {
-        long curL, curR;
-        noInterrupts();
-        curL = encoderCount; curR = encoderCount2;
-        interrupts();
-        long delta = max(abs(curL - distStartL), abs(curR - distStartR));
-        if (delta >= distTarget) {
-          motorBrake(0); motorBrake(1);
-          distCtrlActive = false;
-        }
-      }
+      updateDistanceControl();  // 距离/转向闭环：到达目标自动停车
     }
   }
 
@@ -518,26 +555,41 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       break;
     }
 
-    case CMD_MOVE_DISTANCE: {  // payload: dir(1) speed(1) target(4B big-endian)
+    case CMD_MOVE_DISTANCE: {
+      // payload: dir(1) speed(1) target(4B big-endian)
+      //   dir=0 前进 / dir=1 后退：target = 距离(mm)
+      //   dir=2 左转 / dir=3 右转（原地）：target = 角度(0.1°)
       if (sysState < READY) { sendNack(cmd, ERR_WRONG_STATE); return; }
-      if (len != 6) { sendNack(cmd, ERR_INVALID_PARAM); return; }
-      distDir   = p[0];
-      distSpeed = p[1];
-      distTarget = ((long)p[2] << 24) | ((long)p[3] << 16) | ((long)p[4] << 8) | (long)p[5];
-      if (distDir > 3 || distSpeed == 0 || distSpeed > 100) {
+      if (len != 6)         { sendNack(cmd, ERR_INVALID_PARAM); return; }
+      uint8_t dir = p[0];
+      distSpeed  = p[1];
+      int32_t targetRaw = ((int32_t)p[2] << 24) | ((int32_t)p[3] << 16) |
+                          ((int32_t)p[4] << 8)  |  (int32_t)p[5];
+      if (dir > 3 || distSpeed == 0 || distSpeed > 100 || targetRaw <= 0) {
         sendNack(cmd, ERR_INVALID_PARAM); return;
       }
+
+      // 物理量 → 编码器计数
+      if (dir == 0 || dir == 1) {
+        distTarget = mmToCounts((float)targetRaw);                  // mm → 计数
+      } else {
+        distTarget = degreesToCounts((float)targetRaw / 10.0f);     // 0.1° → 计数
+      }
+      if (distTarget <= 0) { sendNack(cmd, ERR_INVALID_PARAM); return; }
+
+      distDir = dir;
       noInterrupts();
       distStartL = encoderCount;
       distStartR = encoderCount2;
       interrupts();
       distCtrlActive = true;
+
       // 通过 PID 控制（速度 -100~100）
       int s = (int)distSpeed;
-      if (distDir == 0)      { setMotorSpeed(0, s); setMotorSpeed(1, s); }
+      if (distDir == 0)      { setMotorSpeed(0,  s); setMotorSpeed(1,  s); }
       else if (distDir == 1) { setMotorSpeed(0, -s); setMotorSpeed(1, -s); }
-      else if (distDir == 2) { setMotorSpeed(0, -s); setMotorSpeed(1, s); }
-      else                   { setMotorSpeed(0, s); setMotorSpeed(1, -s); }
+      else if (distDir == 2) { setMotorSpeed(0, -s); setMotorSpeed(1,  s); }
+      else                   { setMotorSpeed(0,  s); setMotorSpeed(1, -s); }
       sysState = RUNNING;
       sendAck(cmd);
       break;
@@ -672,18 +724,6 @@ void setMotorSpeed(uint8_t mid, int16_t speed) {
 }
 
 void runMotorControl(float dt) {
-      // 距离闭环：到达目标自动停车
-      if (distCtrlActive) {
-        long curL, curR;
-        noInterrupts();
-        curL = encoderCount; curR = encoderCount2;
-        interrupts();
-        long delta = max(abs(curL - distStartL), abs(curR - distStartR));
-        if (delta >= distTarget) {
-          motorBrake(0); motorBrake(1);
-          distCtrlActive = false;
-        }
-      }
   if (sysState == AUTO_TUNE) { runAutoTune(dt); return; }
   // Motor 1
   if (abs(pid1.target_rpm) < RPM_DEADZONE) {

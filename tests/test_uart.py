@@ -10,7 +10,7 @@ import sys
 import termios
 
 # ── 配置 ──────────────────────────────────────────────
-PORT     = "/dev/ttyS1"
+PORT     = "/dev/cu.usbmodem1201"
 BAUD     = 115200
 TIMEOUT  = 1.0   # 秒
 
