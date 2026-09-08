@@ -121,6 +121,8 @@ unsigned long lastRpmTime = 0;
 
 // --- 距离控制状态（CMD_MOVE_DISTANCE） ---
 bool distCtrlActive = false;
+uint8_t distResult = 0;   // 闭环结果: 0=无/运行中, 1=正常到达, 2=被中断(linkLoss/重置)
+                           // 新 MOVE_DISTANCE/INIT 时清零；随 STATUS 回包上报给主机
 long distStartL = 0, distStartR = 0;
 long distTarget = 0;
 uint8_t distDir = 0;  // 0=forward, 1=backward, 2=left, 3=right
@@ -169,6 +171,7 @@ void updateDistanceControl() {
   if (delta >= distTarget) {
     motorBrake(0); motorBrake(1);
     distCtrlActive = false;
+    distResult = 1;  // 正常到达目标（随下个 STATUS 回包上报）
   }
 }
 
@@ -437,6 +440,7 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       lastCnt1 = 0;   lastCnt2 = 0;
       pid1.integral = 0; pid1.output = 0; pid1.output_f = 0; pid1.prev_error = 0;
       pid2.integral = 0; pid2.output = 0; pid2.output_f = 0; pid2.prev_error = 0;
+      distCtrlActive = false; distResult = 0;
       sysState = IDLE;
       linkLostActive = false;  // 重连/重新初始化后重新武装看门狗
       sendAck(cmd);
@@ -609,6 +613,7 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       if (distTarget <= 0) { sendNack(cmd, ERR_INVALID_PARAM); return; }
 
       distDir = dir;
+      distResult = 0;  // 新闭环开始：清除上次结果
       noInterrupts();
       distStartL = encoderCount;
       distStartR = encoderCount2;
@@ -746,12 +751,14 @@ void sendRpm(uint8_t mid, int16_t rpm) {
 }
 
 void sendStatus() {
-  uint8_t p[5] = {
+  uint8_t p[7] = {
     (uint8_t)sysState,
     (uint8_t)(rpm1 >> 8), (uint8_t)(rpm1 & 0xFF),
-    (uint8_t)(rpm2 >> 8), (uint8_t)(rpm2 & 0xFF)
+    (uint8_t)(rpm2 >> 8), (uint8_t)(rpm2 & 0xFF),
+    (uint8_t)(distCtrlActive ? 1 : 0),  // 闭环是否运行中
+    distResult                          // 闭环结果: 0 无/运行中 1 done 2 aborted
   };
-  sendFrame(RSP_STATUS, p, 5);
+  sendFrame(RSP_STATUS, p, 7);
 }
 
 // ============================================================
@@ -930,6 +937,7 @@ void linkLossStop() {
   motorCoast(0);
   motorCoast(1);
   distCtrlActive = false;            // 取消正在进行的距离/角度闭环
+  distResult     = 2;                // 标记为被中断（linkLoss）
   distTarget     = 0;
   distSpeed      = 0;
   sysState       = IDLE;             // 回到 IDLE，电机保持 0 目标

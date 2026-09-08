@@ -391,3 +391,17 @@ AA 55 90 03 00 00 B9 CHK
 | GPIO8 | 板载蓝色 LED |
 | GPIO20 | UART RX (USB-CDC) |
 | GPIO21 | UART TX (USB-CDC) |
+
+## 距离闭环结果上报（STATUS 回包扩展）
+
+`GET_STATUS (0x21)` / `HEARTBEAT (0x32)` 的响应 `RSP_STATUS (0x91)` 现为 **7 字节**：
+
+```
+[ sysState(1) | rpm1(2) | rpm2(2) | distActive(1) | distResult(1) ]
+```
+
+- `distActive`: 0/1 —— 距离/角度闭环是否运行中
+- `distResult`: 0=无/运行中, 1=正常到达目标, 2=被中断(linkLoss/INIT)
+- 主机在每个 10Hz 轮询（GET_STATUS）顺带读取，闭环完成 ≤100ms 内可见，无需额外轮询；
+- 新 `CMD_MOVE_DISTANCE` / `CMD_INIT` 会把 distResult 清零；闭环到达目标时置 1；失联停车（linkLossStop）置 2。
+- 主机侧须与固件同步升级：按固定 5B 缓冲解析的旧主机读不到 rpm 字段（帧长已 7B），请用 AKA-00 新固件。
