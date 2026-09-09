@@ -40,7 +40,7 @@ struct PIDController;
 #define CMD_SET_PID     0x14  // 设置PID参数
 #define CMD_GET_PID     0x15  // 读取PID参数
 #define CMD_AUTO_TUNE   0x16  // 自动整定PID
-#define CMD_HEARTBEAT   0x32  // 心跳保活：断联超时自动 coast
+#define CMD_HEARTBEAT   0x32  // 兼容命令：回包 STATUS(不再触发断联停车)
 #define CMD_RESET       0xFF
 
 // --- 协议：响应字 ---
@@ -49,14 +49,6 @@ struct PIDController;
 #define RSP_RPM_DATA    0x90
 #define RSP_STATUS      0x91  // 通用状态回包；GET_STATUS / HEARTBEAT 共用
 #define RSP_PID_DATA    0x92  // PID参数响应
-
-// --- 心跳看门狗 ---
-// 主机必须以 ≤ HEARTBEAT_TIMEOUT/2 的周期发送 CMD_HEARTBEAT(0x32) 或其他任意合法帧，
-// 否则视为断联，自动 coast 并回到 IDLE（电机保持 0 目标，需重新 INIT/CONFIG 才能再动）。
-// 阈值取 800ms 而非更严：主机是 SG2002 单核，跑摄像头缩流编码 + WS 推送时，
-// 10Hz 轮询偶尔会被挤到 >300ms 静默 —— 太严会把"瞬时调度尖峰"误判成失联，
-// 导致行驶中自动停车。800ms 下真断联的检测/停车延迟仍 ≤1s，安全余量足够。
-#define HEARTBEAT_TIMEOUT_MS  800
 
 // --- 错误---
 #define ERR_WRONG_STATE   0x01
@@ -100,14 +92,6 @@ unsigned long atStartTime;   // 总计时
 uint16_t cfg_ppr      = PPR_DEFAULT;
 uint16_t cfg_pwm_freq = PWM_FREQ_DEFAULT;
 
-// --- 心跳看门狗状态 ---
-//   lastHeartbeat == 0   表示尚未收到过任何心跳（初始化阶段）
-//   lastHeartbeat != 0   上一次收到合法帧的 millis()
-// 任意合法帧（CHK 通过）都会刷新 lastHeartbeat，不仅限于 0x30；
-// loop() 检查超时后调用 linkLossStop() 自动 coast 并把状态压回 IDLE。
-unsigned long lastHeartbeat  = 0;
-bool          linkLostActive = false;  // 失联保护已触发一次（避免每周期重复刷状态）
-
 // ============================================================
 //  编码器（中断，需 IRAM// ============================================================
 volatile long encoderCount  = 0;
@@ -124,7 +108,7 @@ unsigned long lastRpmTime = 0;
 
 // --- 距离控制状态（CMD_MOVE_DISTANCE） ---
 bool distCtrlActive = false;
-uint8_t distResult = 0;   // 闭环结果: 0=无/运行中, 1=正常到达, 2=被中断(linkLoss/重置)
+uint8_t distResult = 0;   // 闭环结果: 0=无/运行中, 1=正常到达目标 (2 保留未用)
                            // 新 MOVE_DISTANCE/INIT 时清零；随 STATUS 回包上报给主机
 long distStartL = 0, distStartR = 0;
 long distTarget = 0;
@@ -337,14 +321,6 @@ void loop() {
     lastCnt1 = s1; lastCnt2 = s2;
     lastRpmTime = now;
 
-    // 心跳看门狗：仅当处于"可能正在驱动电机"的状态时才启用断联保护。
-    //   - UNINIT / IDLE 阶段本来就没在动，超时也不必强制切状态。
-    //   - READY / RUNNING / AUTO_TUNE 一旦超时，立即 coast 并回 IDLE。
-    if (sysState >= READY && lastHeartbeat != 0 &&
-        (now - lastHeartbeat) > HEARTBEAT_TIMEOUT_MS && !linkLostActive) {
-      linkLossStop();
-    }
-
     if (sysState >= READY) {
       runMotorControl(dt);
       updateDistanceControl();  // 距离/转向闭环：到达目标自动停车
@@ -418,9 +394,6 @@ void processByte(uint8_t b) {
       uint8_t chk = rxCmd ^ rxLen;
       for (uint8_t i = 0; i < rxLen; i++) chk ^= rxBuf[i];
       if (chk == b) {
-        // 任意合法帧（CHK 通过）都刷新心跳时间戳——
-        // 这样断联判据是"链路静默"，而不是"必须发心跳命令"。
-        lastHeartbeat = millis();
         handleCommand(rxCmd, rxBuf, rxLen);
       } else {
         sendNack(rxCmd, ERR_BAD_CHECKSUM);
@@ -445,7 +418,6 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       pid2.integral = 0; pid2.output = 0; pid2.output_f = 0; pid2.prev_error = 0;
       distCtrlActive = false; distResult = 0;
       sysState = IDLE;
-      linkLostActive = false;  // 重连/重新初始化后重新武装看门狗
       sendAck(cmd);
       break;
 
@@ -457,7 +429,6 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       if (cfg_ppr == 0 || cfg_pwm_freq == 0) { sendNack(cmd, ERR_INVALID_PARAM); return; }
       initPWM();
       sysState = READY;
-      linkLostActive = false;  // 进入 READY 即重新武装看门狗（二次失联也能触发停车）
       sendAck(cmd);
       break;
 
@@ -703,13 +674,7 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       break;
 
     case CMD_HEARTBEAT:
-      // 心跳：任意状态（UNINIT 也可）都接受，回包复用 STATUS(0x91) 携带状态+RPM。
-      // 如果之前因超时触发了 linkLossStop()，仅靠这一帧不会恢复电机运行——
-      // 需主机重新发 SET_SPEED / MOVE_DISTANCE 等命令，符合"失联后必须显式恢复"。
-      if (linkLostActive) {
-        // 失联期间收到心跳：清标记，但不重新拉起速度（安全兜底）。
-        linkLostActive = false;
-      }
+      // 兼容命令：任意状态应答，回包 STATUS(0x91)；不再有断联停车语义
       sendStatus();
       break;
 
@@ -930,22 +895,6 @@ void motorBrake(uint8_t mid) {
     analogWrite(IN1_PIN_2, 255); analogWrite(IN2_PIN_2, 255);
     pid2.target_rpm = 0; pid2.integral = 0; pid2.output = 0; pid2.output_f = 0; pid2.prev_error = 0;
   }
-}
-
-// 断联保护：双电机 coast、距离闭环置位、状态机压回 IDLE、清零 PID 状态。
-// 由 loop() 在心跳超时后调用一次；linkLostActive 防重入。
-// 主机重新上电或重连后必须显式发 SET_SPEED / MOVE_DISTANCE 等命令，
-// 不会因为收到新一帧心跳就自动跑起来（符合用户期望）。
-void linkLossStop() {
-  motorCoast(0);
-  motorCoast(1);
-  distCtrlActive = false;            // 取消正在进行的距离/角度闭环
-  distResult     = 2;                // 标记为被中断（linkLoss）
-  distTarget     = 0;
-  distSpeed      = 0;
-  sysState       = IDLE;             // 回到 IDLE，电机保持 0 目标
-  lastHeartbeat  = 0;                // 重置时间戳：下次收到任意合法帧会再次刷新
-  linkLostActive = true;             // 标记失联状态
 }
 
 void motorForward(int s)  { analogWrite(IN1_PIN,   s); analogWrite(IN2_PIN,   0); }
