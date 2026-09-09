@@ -52,8 +52,11 @@ struct PIDController;
 
 // --- 心跳看门狗 ---
 // 主机必须以 ≤ HEARTBEAT_TIMEOUT/2 的周期发送 CMD_HEARTBEAT(0x32) 或其他任意合法帧，
-// 否则视为断联，自动 coast 并回到 IDLE（电机保持 0 目标，需重新发命令才能再动）。
-#define HEARTBEAT_TIMEOUT_MS  300
+// 否则视为断联，自动 coast 并回到 IDLE（电机保持 0 目标，需重新 INIT/CONFIG 才能再动）。
+// 阈值取 800ms 而非更严：主机是 SG2002 单核，跑摄像头缩流编码 + WS 推送时，
+// 10Hz 轮询偶尔会被挤到 >300ms 静默 —— 太严会把"瞬时调度尖峰"误判成失联，
+// 导致行驶中自动停车。800ms 下真断联的检测/停车延迟仍 ≤1s，安全余量足够。
+#define HEARTBEAT_TIMEOUT_MS  800
 
 // --- 错误---
 #define ERR_WRONG_STATE   0x01
