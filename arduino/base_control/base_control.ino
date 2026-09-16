@@ -20,35 +20,40 @@
 #define PPR_DEFAULT       4680
 
 // --- 物理参数（里程计 / 距离换算）---
-#define WHEEL_DIAMETER_MM  62.0f   // 轮径 D
-#define WHEELBASE_MM       160.0f  // 轴距 L（左右轮中心距）
+// 默认值（标称），可用 CMD_SET_PHYS(0x03) 在运行时覆盖；标定后再下发即可一劳永逸。
+// 协议里以 mm × 10 编码（uint16，精度 0.1 mm，范围 0~6553.5 mm）。
+#define WHEEL_DIAMETER_MM_DEFAULT  62.0f   // 轮径 D
+#define WHEELBASE_MM_DEFAULT       160.0f  // 轴距 L（左右轮中心距）
 
 // --- 前向声明（Arduino 自动原型生成需要） ---
 struct PIDController;
 
 // --- 协议：命令字 ---
-#define CMD_INIT        0x01
-#define CMD_CONFIG      0x02
-#define CMD_SET_SPEED   0x10
-#define CMD_STOP        0x11
-#define CMD_BRAKE       0x12
-#define CMD_GET_RPM     0x20
-#define CMD_GET_STATUS  0x21
-#define CMD_GET_ENCODER 0x22  // 读取编码器累计脉冲
-#define CMD_MOVE_DISTANCE 0x23  // 闭环距离控制
-#define CMD_SET_SPEEDS  0x13  // 新增：同时设置双电机速度
-#define CMD_SET_PID     0x14  // 设置PID参数
-#define CMD_GET_PID     0x15  // 读取PID参数
-#define CMD_AUTO_TUNE   0x16  // 自动整定PID
-#define CMD_HEARTBEAT   0x32  // 兼容命令：回包 STATUS(不再触发断联停车)
-#define CMD_RESET       0xFF
+#define CMD_INIT           0x01
+#define CMD_CONFIG         0x02
+#define CMD_SET_PHYS       0x03  // 设置轮径 / 轴距（mm × 10）
+#define CMD_GET_PHYS       0x04
+#define CMD_SET_SPEED      0x10
+#define CMD_STOP           0x11
+#define CMD_BRAKE          0x12
+#define CMD_SET_SPEEDS     0x13  // 同时设置双电机速度
+#define CMD_SET_PID        0x14
+#define CMD_GET_PID        0x15
+#define CMD_AUTO_TUNE      0x16  // PID 自动整定
+#define CMD_GET_RPM        0x20
+#define CMD_GET_STATUS     0x21
+#define CMD_GET_ENCODER    0x22
+#define CMD_MOVE_DISTANCE  0x23  // 闭环距离 / 转向
+#define CMD_HEARTBEAT      0x32
+#define CMD_RESET          0xFF
 
 // --- 协议：响应字 ---
 #define RSP_ACK         0x80
 #define RSP_NACK        0x81
 #define RSP_RPM_DATA    0x90
-#define RSP_STATUS      0x91  // 通用状态回包；GET_STATUS / HEARTBEAT 共用
-#define RSP_PID_DATA    0x92  // PID参数响应
+#define RSP_STATUS      0x91  // GET_STATUS / HEARTBEAT 共用
+#define RSP_PID_DATA    0x92
+#define RSP_PHYS_DATA   0x94  // GET_PHYS 回包
 
 // --- 错误---
 #define ERR_WRONG_STATE   0x01
@@ -65,8 +70,12 @@ HardwareSerial SerialUART0(0);
 #define FRAME_H1  0xAA
 #define FRAME_H2  0x55
 
+// --- 失速保护：低电压/卡死下电机 RPM 跑不到目标会无限等 ---
+#define STALL_TIMEOUT_MS  1500   // 连续 1.5s 双轮 |RPM|<3 且进度<50% → 判失速（distResult=2）
+
 // ============================================================
-//  系统状态// ============================================================
+//  系统状态
+// ============================================================
 enum SysState : uint8_t { UNINIT = 0, IDLE = 1, READY = 2, RUNNING = 3, SYS_ERROR = 4, AUTO_TUNE = 5 };
 SysState sysState = UNINIT;
 
@@ -88,12 +97,18 @@ unsigned long atCrossTime;   // 上次穿越 target 的时间（测 Tu）
 float    atTuSum;            // 振荡周期累加
 unsigned long atStartTime;   // 总计时
 
-// --- 配置（可配置CONFIG 命令修改--
+// --- 配置（可由 CONFIG 命令修改） ---
 uint16_t cfg_ppr      = PPR_DEFAULT;
 uint16_t cfg_pwm_freq = PWM_FREQ_DEFAULT;
 
+// --- 物理参数（可由 CMD_SET_PHYS 覆盖）---
+// 编码协议：mm × 10，例如 62.0 mm 存为 620。
+float cfg_wheel_diameter_mm = WHEEL_DIAMETER_MM_DEFAULT;
+float cfg_wheelbase_mm      = WHEELBASE_MM_DEFAULT;
+
 // ============================================================
-//  编码器（中断，需 IRAM// ============================================================
+//  编码器（中断，需 IRAM）
+// ============================================================
 volatile long encoderCount  = 0;
 volatile long encoderCount2 = 0;
 volatile unsigned long isrCalls1 = 0, isrCalls2 = 0;
@@ -107,23 +122,27 @@ void IRAM_ATTR encB2_ISR() { encoderCount2 += (digitalRead(ENC_A_2) == digitalRe
 unsigned long lastRpmTime = 0;
 
 // --- 距离控制状态（CMD_MOVE_DISTANCE） ---
+//   distResult: 0=无/运行中  1=正常到达目标  2=失速退出
+//   INIT / MOVE_DISTANCE 时清零；随 STATUS 回包上报
 bool distCtrlActive = false;
-uint8_t distResult = 0;   // 闭环结果: 0=无/运行中, 1=正常到达目标 (2 保留未用)
-                           // 新 MOVE_DISTANCE/INIT 时清零；随 STATUS 回包上报给主机
+uint8_t distResult = 0;
 long distStartL = 0, distStartR = 0;
 long distTarget = 0;
 uint8_t distDir = 0;  // 0=forward, 1=backward, 2=left, 3=right
 uint8_t distSpeed = 0;
+unsigned long distStartMs = 0;        // 本次闭环开始的 millis()（用于起步 ramp-up 缓冲期判断）
+unsigned long distStallStartMs = 0;   // 进入失速状态的 millis()（0 表示未失速）
 long lastCnt1 = 0, lastCnt2 = 0;
 int16_t rpm1 = 0, rpm2 = 0;
 
 // ============================================================
 //  里程计换算（轮径 D、轴距 L、编码器 PPR）
+//   所有量都用 cfg_* 运行时变量，参与标定。
 // ============================================================
 
 // 车轮每转行驶距离 (mm)
 float wheelCircumferenceMm() {
-  return WHEEL_DIAMETER_MM * PI;
+  return cfg_wheel_diameter_mm * PI;
 }
 
 // 行驶距离 (mm) → 编码器计数
@@ -139,13 +158,15 @@ float countsToMm(long counts) {
 // 原地转向角度 (度) → 单轮编码器计数
 // 原地转向时每轮弧长 = θ(rad) × (L/2)
 long degreesToCounts(float degrees) {
-  float arcMm = degrees * (PI / 180.0f) * (WHEELBASE_MM / 2.0f);
+  float arcMm = degrees * (PI / 180.0f) * (cfg_wheelbase_mm / 2.0f);
   return mmToCounts(arcMm);
 }
 
 // 距离/转向闭环：到达目标自动停车
-// 直行取左右轮平均（避免单轮打滑/速度差导致提前或滞后停车）；
-// 原地转向两轮反向等速，取较大值
+//   直行取左右轮平均（避免单轮打滑/速度差导致提前或滞后停车）；
+//   原地转向两轮反向等速，取较大值。
+//   速度恒定（由主机 distSpeed 决定），靠 motorBrake 收尾（TT 马达制动距离 ≈ ±0.1°）；
+//   失速保护见 STALL_TIMEOUT_MS，防低电压/卡死无限等待。
 void updateDistanceControl() {
   if (!distCtrlActive) return;
   long curL, curR;
@@ -155,10 +176,30 @@ void updateDistanceControl() {
   long dL = abs(curL - distStartL);
   long dR = abs(curR - distStartR);
   long delta = (distDir == 2 || distDir == 3) ? max(dL, dR) : ((dL + dR) / 2);
+
+  // 正常到达：到目标或过冲后停
   if (delta >= distTarget) {
     motorBrake(0); motorBrake(1);
     distCtrlActive = false;
     distResult = 1;  // 正常到达目标（随下个 STATUS 回包上报）
+    return;
+  }
+
+  // 失速保护：两轮 |RPM| 都很小且未完成 — 电压过低/卡死。强制刹车退出。
+  // 起步阶段（前 200ms）允许 ramp-up，不判失速。
+  unsigned long now = millis();
+  if (now - distStartMs > 200 &&
+      abs(rpm1) < 3 && abs(rpm2) < 3 &&
+      delta < distTarget / 2) {        // 进度不到一半才认作失速
+    if (distStallStartMs == 0) distStallStartMs = now;
+    if (now - distStallStartMs > STALL_TIMEOUT_MS) {
+      motorBrake(0); motorBrake(1);
+      distCtrlActive = false;
+      distResult = 2;  // 失速退出（区别于正常到达）
+      distStallStartMs = 0;
+    }
+  } else {
+    distStallStartMs = 0;
   }
 }
 
@@ -242,7 +283,8 @@ void computePID(PIDController* pid, float target_rpm, float current_rpm) {
 }
 
 // ============================================================
-//  LED 状态// ============================================================
+//  LED 状态
+// ============================================================
 unsigned long lastLedTime = 0;
 uint8_t ledPhase = 0;
 
@@ -255,7 +297,8 @@ uint8_t rxCmd, rxLen, rxIdx;
 uint8_t rxBuf[16];
 
 // ============================================================
-//  初始化辅助// ============================================================
+//  初始化辅助
+// ============================================================
 void initMotorPins(int p1, int p2) {
   pinMode(p1, OUTPUT);
   pinMode(p2, OUTPUT);
@@ -416,7 +459,10 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       lastCnt1 = 0;   lastCnt2 = 0;
       pid1.integral = 0; pid1.output = 0; pid1.output_f = 0; pid1.prev_error = 0;
       pid2.integral = 0; pid2.output = 0; pid2.output_f = 0; pid2.prev_error = 0;
-      distCtrlActive = false; distResult = 0;
+      distCtrlActive = false;
+      distResult = 0;
+      distStartMs = 0;
+      distStallStartMs = 0;
       sysState = IDLE;
       sendAck(cmd);
       break;
@@ -431,6 +477,36 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       sysState = READY;
       sendAck(cmd);
       break;
+
+    case CMD_SET_PHYS: {
+      // 设置轮径 D、轴距 L（mm × 10，精度 0.1 mm）。
+      // 任意状态都允许（不影响电机运行，下一次 MOVE_DISTANCE 生效）。
+      if (len < 4) { sendNack(cmd, ERR_INVALID_PARAM); return; }
+      uint16_t d_q10 = (uint16_t)(p[0] << 8 | p[1]);   // 轮径 × 10
+      uint16_t l_q10 = (uint16_t)(p[2] << 8 | p[3]);   // 轴距 × 10
+      float d_mm = d_q10 * 0.1f;
+      float l_mm = l_q10 * 0.1f;
+      // 合理性检查：TT 马达轮径常见 40~80mm，轴距 80~300mm。
+      if (d_mm < 20.0f || d_mm > 100.0f ||
+          l_mm < 50.0f || l_mm > 500.0f) {
+        sendNack(cmd, ERR_INVALID_PARAM); return;
+      }
+      cfg_wheel_diameter_mm = d_mm;
+      cfg_wheelbase_mm      = l_mm;
+      sendAck(cmd);
+      break;
+    }
+
+    case CMD_GET_PHYS: {
+      // 回包 RSP_PHYS_DATA(0x94)：4 字节 payload，D 和 L 都用 mm × 10 表示。
+      uint16_t d_q10 = (uint16_t)(cfg_wheel_diameter_mm * 10.0f + 0.5f);
+      uint16_t l_q10 = (uint16_t)(cfg_wheelbase_mm      * 10.0f + 0.5f);
+      uint8_t buf[4];
+      buf[0] = (uint8_t)(d_q10 >> 8); buf[1] = (uint8_t)(d_q10 & 0xFF);
+      buf[2] = (uint8_t)(l_q10 >> 8); buf[3] = (uint8_t)(l_q10 & 0xFF);
+      sendFrame(RSP_PHYS_DATA, buf, 4);
+      break;
+    }
 
     case CMD_SET_SPEED: {
       if (sysState < READY) { sendNack(cmd, ERR_WRONG_STATE); return; }
@@ -587,7 +663,9 @@ void handleCommand(uint8_t cmd, uint8_t *p, uint8_t len) {
       if (distTarget <= 0) { sendNack(cmd, ERR_INVALID_PARAM); return; }
 
       distDir = dir;
-      distResult = 0;  // 新闭环开始：清除上次结果
+      distResult = 0;
+      distStartMs = millis();
+      distStallStartMs = 0;
       noInterrupts();
       distStartL = encoderCount;
       distStartR = encoderCount2;
